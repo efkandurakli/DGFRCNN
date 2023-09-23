@@ -5,6 +5,7 @@ from __future__ import print_function
 import math
 import sys
 import time
+from pytorch_lightning.utilities.types import EVAL_DATALOADERS
 from tqdm.notebook import tqdm
 import numpy as np
 from pathlib import Path
@@ -36,7 +37,7 @@ from albumentations.pytorch import ToTensorV2
 
 
 # Pytorch import
-from pytorch_lightning.core.lightning import LightningModule
+from pytorch_lightning.core import LightningModule
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.callbacks import LearningRateMonitor
@@ -50,6 +51,9 @@ from torchvision.models.detection.roi_heads import RoIHeads
 from collections import OrderedDict
 from torchvision.models.detection.image_list import ImageList
 from typing import List, Tuple
+
+from coco_utils import convert_wheat_dataset_to_coco
+from coco_eval import CocoEvaluator
 
 
 class WheatDataset(Dataset):
@@ -373,6 +377,10 @@ class DGFasterRCNN(LightningModule):
 
       return torch.utils.data.DataLoader(tr_dataset, batch_size=self.batchsize, sampler=sample_indices, shuffle=False, collate_fn=collate_fn, num_workers=4)
       
+
+    def val_dataloader(self):
+       return torch.utils.data.DataLoader(vl_dataset, batch_size=1, shuffle=False,  collate_fn=collate_fn, num_workers=4)
+
     def training_step(self, batch, batch_idx):
       
       imgs = list(image.cuda() for image in batch[0]) 
@@ -500,15 +508,23 @@ class DGFasterRCNN(LightningModule):
       img, boxes, domain, _ = batch
       
       preds = self.forward(img)
+
+      res = {(batch_idx+1): pred for pred in preds}
+
+      self.coco_evaluator.update(res)
+
       preds[0]['boxes'] = preds[0]['boxes'][preds[0]['scores'] > 0.5]
       #self.val_acc = torch.mean(torch.stack([self.accuracy(b,pb["boxes"],iou_threshold=0.5) for b,pb in zip(boxes,pred_boxes)]))
       self.val_acc_stack[domain[0]].append(torch.stack([self.accuracy(b,pb["boxes"],iou_threshold=0.5) for b,pb in zip(boxes,preds)]))
 
       #return val_acc_stack
     
-    def validation_epoch_end(self, validation_step_outputs):
+    def on_validation_epoch_start(self):
+      val_dataloader = self.val_dataloader()
+      coco = convert_wheat_dataset_to_coco(val_dataloader.dataset)
+      self.coco_evaluator = CocoEvaluator(coco, iou_types=["bbox"])
 
-         
+    def on_validation_epoch_end(self):         
       temp = 0
       non_zero_domains = 0
       
@@ -530,6 +546,8 @@ class DGFasterRCNN(LightningModule):
       self.val_acc_stack = [[] for i in range(self.n_vdomains)]
       
       print('Validation ADA: ',temp)
+      self.coco_evaluator.accumulate()
+      self.coco_evaluator.summarize()
       self.mode = 0
       
       
@@ -572,9 +590,8 @@ class DGFasterRCNN(LightningModule):
       elif total_gt > 0 and total_pred == 0:
           return torch.tensor(0.).cuda()
           
-tr_dataset = WheatDataset('../datasets/Annots/official_train.csv', root_dir='../datasets/gwhd_2021/images/', image_set = 'train', transform=train_transform)
-vl_dataset = WheatDataset('../datasets/Annots/official_val.csv', root_dir='../datasets/gwhd_2021/images/', image_set = 'val', transform=valid_transform)
-val_dataloader = torch.utils.data.DataLoader(vl_dataset, batch_size=1, shuffle=False,  collate_fn=collate_fn, num_workers=4)
+tr_dataset = WheatDataset('datasets/gwhd_2021/annots/official_train.csv', root_dir='datasets/gwhd_2021/images/', image_set = 'train', transform=train_transform)
+vl_dataset = WheatDataset('datasets/gwhd_2021/annots/official_val.csv', root_dir='datasets/gwhd_2021/images/', image_set = 'val', transform=valid_transform)
 
            
 import os
@@ -594,13 +611,13 @@ early_stop_callback= EarlyStopping(monitor='val_acc', min_delta=0.00, patience=1
 
 
 checkpoint_callback = ModelCheckpoint(monitor='val_loss', dirpath=NET_FOLDER, filename=weights_file)
-trainer = Trainer(gpus=1, progress_bar_refresh_rate=1, max_epochs=100, deterministic=False, callbacks=[checkpoint_callback, early_stop_callback], reload_dataloaders_every_n_epochs=1)
-trainer.fit(detector, val_dataloaders=val_dataloader)
+trainer = Trainer(devices=1, enable_progress_bar=True, max_epochs=100, deterministic=False, callbacks=[checkpoint_callback, early_stop_callback], reload_dataloaders_every_n_epochs=1, num_sanity_val_steps=0)
+trainer.fit(detector)
 
 
 detector.load_state_dict(torch.load(NET_FOLDER+'/'+weights_file+'.ckpt')['state_dict'])
 detector.freeze()
-test_dataset = WheatDataset('../datasets/Annots/official_test.csv', root_dir='../datasets/gwhd_2021/images/', image_set = 'test', transform=valid_transform)
+test_dataset = WheatDataset('datasets/gwhd_2021/annots/official_test.csv', root_dir='datasets/gwhd_2021/images/', image_set = 'test', transform=valid_transform)
 
 detector.detector.eval()
 test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=4)
